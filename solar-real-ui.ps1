@@ -72,6 +72,12 @@ try {
     $newTitle = [regex]::Replace($titleMatch.Value, '"Winutil"', '"Solar Tweaking Util"', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
     $source = $source.Substring(0, $absoluteTitleIndex) + $newTitle + $source.Substring($absoluteTitleIndex + $titleMatch.Length)
 
+    # Recalculate after changing the title because that edit shifts all later character offsets.
+    $logoIndex = $source.IndexOf($logoStatement, [StringComparison]::Ordinal)
+    if ($logoIndex -lt 0) {
+        throw 'The WinUtil logo hook disappeared after the title edit. No UI changes were applied.'
+    }
+
     $lineStart = $source.LastIndexOf("`n", $logoIndex)
     if ($lineStart -lt 0) { $lineStart = 0 } else { $lineStart++ }
     $indent = $source.Substring($lineStart, $logoIndex - $lineStart)
