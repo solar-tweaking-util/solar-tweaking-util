@@ -1,294 +1,360 @@
-# Solar Tweaking Util - Windows 11 PowerShell GUI
-# Independent implementation. Inspired by common Windows utility workflows.
-# All registry actions are backed up before change; review each item before applying.
+# Solar Tweaking Util - compact WinUtil-inspired Windows 11 utility
+# Independent PowerShell/WPF implementation. Requires Windows PowerShell 5.1+ and Administrator.
+# Registry preferences are backed up before modification. Review descriptions before applying.
+# This utility does not bypass Tamper Protection, Secure Boot, driver protections, or thermal safeguards.
 
+#Requires -Version 5.1
 $ErrorActionPreference = 'Stop'
-$script:SolarRoot = Join-Path $env:ProgramData 'SolarTweakingUtil'
-$script:BackupRoot = Join-Path $script:SolarRoot 'Backups'
-$script:LogFile = Join-Path $script:SolarRoot 'solar.log'
-New-Item -ItemType Directory -Path $script:BackupRoot -Force | Out-Null
 
-function Write-SolarLog([string]$Message) {
-    $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message"
-    Add-Content -LiteralPath $script:LogFile -Value $line -ErrorAction SilentlyContinue
-}
 function Test-SolarAdmin {
-    $p = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-    return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 if (-not (Test-SolarAdmin)) {
-    Start-Process powershell.exe -Verb RunAs -ArgumentList '-NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/solar-tweaking-util/solar-tweaking-util/main/solar.ps1 | iex"'
-    return
+    $argsLine = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    Start-Process powershell.exe -Verb RunAs -ArgumentList $argsLine
+    exit
 }
 
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+$script:Root = Join-Path $env:ProgramData 'SolarTweakingUtil'
+$script:BackupRoot = Join-Path $script:Root 'Backups'
+$script:LogPath = Join-Path $script:Root 'Solar.log'
+New-Item -ItemType Directory -Path $script:BackupRoot -Force | Out-Null
+$script:SessionBackup = Join-Path $script:BackupRoot ("Session-" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+New-Item -ItemType Directory -Path $script:SessionBackup -Force | Out-Null
+$script:BackupFile = Join-Path $script:SessionBackup 'registry.json'
+$script:ServiceBackup = Join-Path $script:SessionBackup 'services.json'
+$script:ChangedRegistry = @{}
+$script:ChangedServices = @{}
+
+function Write-Log([string]$Message) {
+    $line = "[{0}] {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
+    Add-Content -LiteralPath $script:LogPath -Value $line
+    if ($script:LogBox) {
+        $script:LogBox.AppendText($line + [Environment]::NewLine)
+        $script:LogBox.ScrollToEnd()
+    }
+    if ($script:StatusText) { $script:StatusText.Text = $Message }
+}
+
+function Get-RegistryValueState([string]$Path, [string]$Name) {
+    $keyPath = "Registry::HKEY_CURRENT_USER\$Path"
+    $key = Get-Item -LiteralPath $keyPath -ErrorAction SilentlyContinue
+    if (-not $key) { return [pscustomobject]@{ Exists=$false; Value=$null; Kind='DWord' } }
+    try {
+        $value = $key.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        if ($null -eq $value -and $key.GetValueNames() -notcontains $Name) {
+            return [pscustomobject]@{ Exists=$false; Value=$null; Kind='DWord' }
+        }
+        $kind = $key.GetValueKind($Name).ToString()
+        return [pscustomobject]@{ Exists=$true; Value=$value; Kind=$kind }
+    } finally { $key.Close() }
+}
+
+function Save-RegistryState([string]$Path, [string]$Name) {
+    $id = "$Path|$Name"
+    if ($script:ChangedRegistry.ContainsKey($id)) { return }
+    $state = Get-RegistryValueState -Path $Path -Name $Name
+    $script:ChangedRegistry[$id] = [pscustomobject]@{
+        Path=$Path; Name=$Name; Exists=$state.Exists; Value=$state.Value; Kind=$state.Kind
+    }
+    @($script:ChangedRegistry.Values) | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $script:BackupFile -Encoding UTF8
+}
+
+function Set-SolarRegistryValue($Tweak) {
+    Save-RegistryState -Path $Tweak.Path -Name $Tweak.Name
+    $keyPath = "Registry::HKEY_CURRENT_USER\$($Tweak.Path)"
+    if (-not (Test-Path -LiteralPath $keyPath)) { New-Item -Path $keyPath -Force | Out-Null }
+    $kind = [Microsoft.Win32.RegistryValueKind]::$($Tweak.Kind)
+    $key = Get-Item -LiteralPath $keyPath
+    try { $key.SetValue($Tweak.Name, $Tweak.Value, $kind) } finally { $key.Close() }
+}
+
+function Restore-RegistryBackup([string]$File) {
+    if (-not (Test-Path -LiteralPath $File)) { return }
+    $items = @(Get-Content -LiteralPath $File -Raw | ConvertFrom-Json)
+    foreach ($item in $items) {
+        try {
+            $keyPath = "Registry::HKEY_CURRENT_USER\$($item.Path)"
+            if (-not (Test-Path -LiteralPath $keyPath)) { New-Item -Path $keyPath -Force | Out-Null }
+            $key = Get-Item -LiteralPath $keyPath
+            try {
+                if ($item.Exists) {
+                    $kind = [Microsoft.Win32.RegistryValueKind]::$($item.Kind)
+                    $key.SetValue([string]$item.Name, $item.Value, $kind)
+                } else {
+                    $key.DeleteValue([string]$item.Name, $false)
+                }
+            } finally { $key.Close() }
+            Write-Log "Restored $($item.Path)\$($item.Name)"
+        } catch { Write-Log "Restore failed for $($item.Name): $($_.Exception.Message)" }
+    }
+}
+
+function Save-ServiceState([string]$Name) {
+    if ($script:ChangedServices.ContainsKey($Name)) { return }
+    $svc = Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue
+    if (-not $svc) { throw "Service $Name was not found." }
+    $script:ChangedServices[$Name] = [pscustomobject]@{ Name=$Name; StartMode=$svc.StartMode; State=$svc.State }
+    @($script:ChangedServices.Values) | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:ServiceBackup -Encoding UTF8
+}
+
+# Each entry is an actual per-user registry preference. No placeholder or fake "FPS" switches.
 $script:Tweaks = @(
-    [pscustomobject]@{ Name="Enable Game Mode"; Category="Gaming"; Path="HKCU:\\Software\\Microsoft\\GameBar"; ValueName="AutoGameModeEnabled"; Data=1; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Enable Game Mode capture preference"; Category="Gaming"; Path="HKCU:\\Software\\Microsoft\\GameBar"; ValueName="AllowAutoGameMode"; Data=1; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable Game DVR capture"; Category="Gaming"; Path="HKCU:\\System\\GameConfigStore"; ValueName="GameDVR_Enabled"; Data=0; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable Game DVR policy"; Category="Gaming"; Path="HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\GameDVR"; ValueName="AllowGameDVR"; Data=0; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable Xbox background recording"; Category="Gaming"; Path="HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\GameDVR"; ValueName="AppCaptureEnabled"; Data=0; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Prefer high performance GPU scheduling"; Category="Gaming"; Path="HKLM:\\SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers"; ValueName="HwSchMode"; Data=2; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable fullscreen optimizations compatibility toggle"; Category="Gaming"; Path="HKCU:\\System\\GameConfigStore"; ValueName="GameDVR_FSEBehaviorMode"; Data=2; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Set game priority profile"; Category="Gaming"; Path="HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile"; ValueName="SystemResponsiveness"; Data=10; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Set games task GPU priority"; Category="Gaming"; Path="HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile\\Tasks\\Games"; ValueName="GPU Priority"; Data=8; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Set games task CPU priority"; Category="Gaming"; Path="HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile\\Tasks\\Games"; ValueName="Priority"; Data=6; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Show file extensions"; Category="Explorer"; Path="HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced"; ValueName="HideFileExt"; Data=0; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Show hidden files"; Category="Explorer"; Path="HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced"; ValueName="Hidden"; Data=1; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Show protected OS files"; Category="Explorer"; Path="HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced"; ValueName="ShowSuperHidden"; Data=1; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Launch Explorer to This PC"; Category="Explorer"; Path="HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced"; ValueName="LaunchTo"; Data=1; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable taskbar widgets button"; Category="Explorer"; Path="HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced"; ValueName="TaskbarDa"; Data=0; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable taskbar chat button"; Category="Explorer"; Path="HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced"; ValueName="TaskbarMn"; Data=0; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable search highlights"; Category="Explorer"; Path="HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\SearchSettings"; ValueName="IsDynamicSearchBoxEnabled"; Data=0; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable recent files in Quick Access"; Category="Explorer"; Path="HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer"; ValueName="ShowRecent"; Data=0; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable frequent folders in Quick Access"; Category="Explorer"; Path="HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer"; ValueName="ShowFrequent"; Data=0; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Use classic context menu"; Category="Explorer"; Path="HKCU:\\Software\\Classes\\CLSID\\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\\InprocServer32"; ValueName=""; Data=""; Kind="String"; Protected=$false }
-    [pscustomobject]@{ Name="Disable advertising ID"; Category="Privacy"; Path="HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\AdvertisingInfo"; ValueName="Enabled"; Data=0; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable tailored experiences"; Category="Privacy"; Path="HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Privacy"; ValueName="TailoredExperiencesWithDiagnosticDataEnabled"; Data=0; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable app launch tracking"; Category="Privacy"; Path="HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced"; ValueName="Start_TrackProgs"; Data=0; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable suggested content"; Category="Privacy"; Path="HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager"; ValueName="SubscribedContent-338387Enabled"; Data=0; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable tips and suggestions"; Category="Privacy"; Path="HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager"; ValueName="SubscribedContent-338389Enabled"; Data=0; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable consumer experiences"; Category="Privacy"; Path="HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\CloudContent"; ValueName="DisableWindowsConsumerFeatures"; Data=1; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable activity history publishing"; Category="Privacy"; Path="HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\System"; ValueName="PublishUserActivities"; Data=0; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable activity history upload"; Category="Privacy"; Path="HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\System"; ValueName="UploadUserActivities"; Data=0; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable app diagnostic access"; Category="Privacy"; Path="HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\AppPrivacy"; ValueName="LetAppsGetDiagnosticInfo"; Data=2; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable online speech recognition"; Category="Privacy"; Path="HKCU:\\Software\\Microsoft\\Speech_OneCore\\Settings\\OnlineSpeechPrivacy"; ValueName="HasAccepted"; Data=0; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable transparency effects"; Category="Performance"; Path="HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"; ValueName="EnableTransparency"; Data=0; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Prefer performance visual effects"; Category="Performance"; Path="HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VisualEffects"; ValueName="VisualFXSetting"; Data=2; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable minimize/maximize animation"; Category="Performance"; Path="HKCU:\\Control Panel\\Desktop\\WindowMetrics"; ValueName="MinAnimate"; Data="0"; Kind="String"; Protected=$false }
-    [pscustomobject]@{ Name="Set menu show delay to zero"; Category="Performance"; Path="HKCU:\\Control Panel\\Desktop"; ValueName="MenuShowDelay"; Data="0"; Kind="String"; Protected=$false }
-    [pscustomobject]@{ Name="Disable mouse acceleration"; Category="Performance"; Path="HKCU:\\Control Panel\\Mouse"; ValueName="MouseSpeed"; Data="0"; Kind="String"; Protected=$false }
-    [pscustomobject]@{ Name="Disable mouse threshold 1"; Category="Performance"; Path="HKCU:\\Control Panel\\Mouse"; ValueName="MouseThreshold1"; Data="0"; Kind="String"; Protected=$false }
-    [pscustomobject]@{ Name="Disable mouse threshold 2"; Category="Performance"; Path="HKCU:\\Control Panel\\Mouse"; ValueName="MouseThreshold2"; Data="0"; Kind="String"; Protected=$false }
-    [pscustomobject]@{ Name="Disable background app global policy"; Category="Performance"; Path="HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\AppPrivacy"; ValueName="LetAppsRunInBackground"; Data=2; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable lock screen tips"; Category="Performance"; Path="HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager"; ValueName="RotatingLockScreenEnabled"; Data=0; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable app suggestions in Start"; Category="Performance"; Path="HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager"; ValueName="SystemPaneSuggestionsEnabled"; Data=0; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable network throttling index"; Category="Network"; Path="HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile"; ValueName="NetworkThrottlingIndex"; Data=4294967295; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Set TCP time-wait delay"; Category="Network"; Path="HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters"; ValueName="TcpTimedWaitDelay"; Data=30; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Set TCP keep-alive time"; Category="Network"; Path="HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters"; ValueName="KeepAliveTime"; Data=300000; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable consumer Wi-Fi hotspot auto-connect"; Category="Network"; Path="HKLM:\\SOFTWARE\\Microsoft\\WcmSvc\\wifinetworkmanager\\config"; ValueName="AutoConnectAllowedOEM"; Data=0; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable Windows peer update sharing"; Category="Network"; Path="HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\DeliveryOptimization"; ValueName="DODownloadMode"; Data=0; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable Delivery Optimization peer mode"; Category="Network"; Path="HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\DeliveryOptimization\\Config"; ValueName="DODownloadMode"; Data=0; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Set DNS over HTTPS policy to automatic"; Category="Network"; Path="HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\DNSClient"; ValueName="DoHPolicy"; Data=2; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Set TCP maximum retransmission count"; Category="Network"; Path="HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters"; ValueName="TcpMaxDataRetransmissions"; Data=5; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable restart notifications during active hours"; Category="Updates"; Path="HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU"; ValueName="NoAutoRebootWithLoggedOnUsers"; Data=1; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable update toast notifications"; Category="Updates"; Path="HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate"; ValueName="SetUpdateNotificationLevel"; Data=1; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable driver updates through Windows Update"; Category="Updates"; Path="HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate"; ValueName="ExcludeWUDriversInQualityUpdate"; Data=1; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Set automatic update notification-only policy"; Category="Updates"; Path="HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU"; ValueName="AUOptions"; Data=2; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Enable Storage Sense"; Category="Storage"; Path="HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\StorageSense\\Parameters\\StoragePolicy"; ValueName="01"; Data=1; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Enable NTFS long paths"; Category="System"; Path="HKLM:\\SYSTEM\\CurrentControlSet\\Control\\FileSystem"; ValueName="LongPathsEnabled"; Data=1; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable error reporting prompts"; Category="System"; Path="HKLM:\\SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting"; ValueName="Disabled"; Data=1; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable remote assistance"; Category="System"; Path="HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Remote Assistance"; ValueName="fAllowToGetHelp"; Data=0; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable AutoPlay"; Category="System"; Path="HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\AutoplayHandlers"; ValueName="DisableAutoplay"; Data=1; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable autorun"; Category="System"; Path="HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer"; ValueName="NoDriveTypeAutoRun"; Data=255; Kind="DWord"; Protected=$false }
-    [pscustomobject]@{ Name="Disable sticky keys shortcut prompt"; Category="System"; Path="HKCU:\\Control Panel\\Accessibility\\StickyKeys"; ValueName="Flags"; Data="506"; Kind="String"; Protected=$false }
-    [pscustomobject]@{ Name="Disable filter keys shortcut prompt"; Category="System"; Path="HKCU:\\Control Panel\\Accessibility\\Keyboard Response"; ValueName="Flags"; Data="122"; Kind="String"; Protected=$false }
-    [pscustomobject]@{ Name="Disable toggle keys shortcut prompt"; Category="System"; Path="HKCU:\\Control Panel\\Accessibility\\ToggleKeys"; ValueName="Flags"; Data="58"; Kind="String"; Protected=$false }
-    [pscustomobject]@{ Name="Disable Bluetooth service"; Category="Protected Controls"; Path=''; ValueName=''; Data="bthserv"; Kind='Protected'; Protected=$true }
-    [pscustomobject]@{ Name="Disable Windows Update service"; Category="Protected Controls"; Path=''; ValueName=''; Data="wuauserv"; Kind='Protected'; Protected=$true }
-    [pscustomobject]@{ Name="Disable Microsoft Defender real-time monitoring"; Category="Protected Controls"; Path=''; ValueName=''; Data="Defender"; Kind='Protected'; Protected=$true }
-    [pscustomobject]@{ Name="Disable Windows Firewall profiles"; Category="Protected Controls"; Path=''; ValueName=''; Data="Firewall"; Kind='Protected'; Protected=$true }
-    [pscustomobject]@{ Name="Disable SmartScreen reputation checks"; Category="Protected Controls"; Path=''; ValueName=''; Data="SmartScreen"; Kind='Protected'; Protected=$true }
+@{Id='GameMode';Name='Enable Windows Game Mode';Category='Gaming';Path='Software\Microsoft\GameBar';ValueName='AutoGameModeEnabled';Value=1;Kind='DWord';Description='Enables the Windows Game Mode preference.';Risk='Low'},
+@{Id='GameMode2';Name='Allow automatic Game Mode';Category='Gaming';Path='Software\Microsoft\GameBar';ValueName='AllowAutoGameMode';Value=1;Kind='DWord';Description='Allows Windows to manage Game Mode automatically.';Risk='Low'},
+@{Id='GameDVR';Name='Disable Game DVR capture';Category='Gaming';Path='System\GameConfigStore';ValueName='GameDVR_Enabled';Value=0;Kind='DWord';Description='Disables the current-user Game DVR capture preference.';Risk='Low'},
+@{Id='GameDVR2';Name='Disable app capture';Category='Gaming';Path='Software\Microsoft\Windows\CurrentVersion\GameDVR';ValueName='AppCaptureEnabled';Value=0;Kind='DWord';Description='Disables Windows app capture preference for this user.';Risk='Low'},
+@{Id='FullscreenOpt';Name='Disable fullscreen optimizations override';Category='Gaming';Path='System\GameConfigStore';ValueName='GameDVR_FSEBehaviorMode';Value=2;Kind='DWord';Description='Sets the per-user fullscreen behavior preference; game compatibility can vary.';Risk='Medium'},
+@{Id='XboxGameBar';Name='Disable Xbox Game Bar presence writer';Category='Gaming';Path='Software\Microsoft\GameBar';ValueName='ShowStartupPanel';Value=0;Kind='DWord';Description='Hides the Game Bar startup panel. Does not uninstall Game Bar.';Risk='Low'},
+@{Id='GameBarTips';Name='Disable Game Bar tips';Category='Gaming';Path='Software\Microsoft\GameBar';ValueName='UseNexusForGameBarEnabled';Value=0;Kind='DWord';Description='Turns off a Game Bar integration preference.';Risk='Low'},
+@{Id='MouseSpeed';Name='Disable mouse acceleration';Category='Gaming';Path='Control Panel\Mouse';ValueName='MouseSpeed';Value='0';Kind='String';Description='Disables Windows pointer acceleration.';Risk='Low'},
+@{Id='MouseThreshold1';Name='Disable mouse threshold 1';Category='Gaming';Path='Control Panel\Mouse';ValueName='MouseThreshold1';Value='0';Kind='String';Description='Sets the first mouse acceleration threshold to zero.';Risk='Low'},
+@{Id='MouseThreshold2';Name='Disable mouse threshold 2';Category='Gaming';Path='Control Panel\Mouse';ValueName='MouseThreshold2';Value='0';Kind='String';Description='Sets the second mouse acceleration threshold to zero.';Risk='Low'},
+@{Id='VisualFX';Name='Prefer performance visual effects';Category='Performance';Path='Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects';ValueName='VisualFXSetting';Value=2;Kind='DWord';Description='Selects the Windows visual-effects performance preset.';Risk='Low'},
+@{Id='MenuDelay';Name='Reduce menu show delay';Category='Performance';Path='Control Panel\Desktop';ValueName='MenuShowDelay';Value='0';Kind='String';Description='Sets the menu animation delay to zero milliseconds.';Risk='Low'},
+@{Id='MinAnimate';Name='Disable window minimize animation';Category='Performance';Path='Control Panel\Desktop\WindowMetrics';ValueName='MinAnimate';Value='0';Kind='String';Description='Disables the minimize/maximize animation preference.';Risk='Low'},
+@{Id='TaskbarAnimations';Name='Disable taskbar animations';Category='Performance';Path='Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced';ValueName='TaskbarAnimations';Value=0;Kind='DWord';Description='Disables taskbar animation preference.';Risk='Low'},
+@{Id='Transparency';Name='Disable transparency effects';Category='Performance';Path='Software\Microsoft\Windows\CurrentVersion\Themes\Personalize';ValueName='EnableTransparency';Value=0;Kind='DWord';Description='Disables Windows transparency effects for this user.';Risk='Low'},
+@{Id='VisualFX2';Name='Disable animation effects';Category='Performance';Path='Software\Microsoft\Windows\CurrentVersion\Accessibility';ValueName='AnimationEffects';Value=0;Kind='DWord';Description='Turns off animation effects preference.';Risk='Low'},
+@{Id='SmoothScroll';Name='Disable smooth scrolling preference';Category='Performance';Path='Control Panel\Desktop';ValueName='SmoothScroll';Value=0;Kind='DWord';Description='Sets the legacy smooth-scroll preference to off where honored.';Risk='Low'},
+@{Id='BackgroundApps';Name='Disable background app global policy';Category='Privacy';Path='Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications';ValueName='GlobalUserDisabled';Value=1;Kind='DWord';Description='Restricts background app activity for this user; app behavior varies.';Risk='Medium'},
+@{Id='Suggestions';Name='Disable Start app suggestions';Category='Privacy';Path='Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager';ValueName='SystemPaneSuggestionsEnabled';Value=0;Kind='DWord';Description='Disables one Windows content suggestion preference.';Risk='Low'},
+@{Id='SubscribedContent1';Name='Disable suggested content 338388';Category='Privacy';Path='Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager';ValueName='SubscribedContent-338388Enabled';Value=0;Kind='DWord';Description='Disables a Windows consumer-content subscription.';Risk='Low'},
+@{Id='SubscribedContent2';Name='Disable suggested content 353694';Category='Privacy';Path='Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager';ValueName='SubscribedContent-353694Enabled';Value=0;Kind='DWord';Description='Disables a Windows consumer-content subscription.';Risk='Low'},
+@{Id='SubscribedContent3';Name='Disable suggested content 353696';Category='Privacy';Path='Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager';ValueName='SubscribedContent-353696Enabled';Value=0;Kind='DWord';Description='Disables a Windows consumer-content subscription.';Risk='Low'},
+@{Id='SoftLanding';Name='Disable Windows tips';Category='Privacy';Path='Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager';ValueName='SoftLandingEnabled';Value=0;Kind='DWord';Description='Disables Windows tips and suggestions preference.';Risk='Low'},
+@{Id='RotatingLock';Name='Disable lock screen tips';Category='Privacy';Path='Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager';ValueName='RotatingLockScreenOverlayEnabled';Value=0;Kind='DWord';Description='Disables lock-screen overlay suggestions.';Risk='Low'},
+@{Id='AdvertisingId';Name='Disable advertising ID';Category='Privacy';Path='Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo';ValueName='Enabled';Value=0;Kind='DWord';Description='Disables the advertising ID preference for this user.';Risk='Low'},
+@{Id='Tailored';Name='Disable tailored experiences';Category='Privacy';Path='Software\Microsoft\Windows\CurrentVersion\Privacy';ValueName='TailoredExperiencesWithDiagnosticDataEnabled';Value=0;Kind='DWord';Description='Opts out of tailored experiences based on diagnostic data.';Risk='Low'},
+@{Id='Feedback';Name='Set feedback frequency to never';Category='Privacy';Path='Software\Microsoft\Siuf\Rules';ValueName='NumberOfSIUFInPeriod';Value=0;Kind='DWord';Description='Sets the current-user feedback frequency preference.';Risk='Low'},
+@{Id='SearchHighlights';Name='Disable search highlights';Category='Privacy';Path='Software\Microsoft\Windows\CurrentVersion\SearchSettings';ValueName='IsDynamicSearchBoxEnabled';Value=0;Kind='DWord';Description='Disables dynamic search box suggestions where supported.';Risk='Low'},
+@{Id='BingSearch';Name='Disable web search suggestions in Start';Category='Privacy';Path='Software\Policies\Microsoft\Windows\Explorer';ValueName='DisableSearchBoxSuggestions';Value=1;Kind='DWord';Description='Applies a per-user policy to hide web suggestions in search.';Risk='Medium'},
+@{Id='ClipboardHistory';Name='Disable clipboard history';Category='Privacy';Path='Software\Microsoft\Clipboard';ValueName='EnableClipboardHistory';Value=0;Kind='DWord';Description='Disables clipboard history; normal copy/paste remains.';Risk='Low'},
+@{Id='ActivityFeed';Name='Disable activity feed publishing';Category='Privacy';Path='Software\Policies\Microsoft\Windows\System';ValueName='EnableActivityFeed';Value=0;Kind='DWord';Description='Disables the activity feed policy for this user.';Risk='Medium'},
+@{Id='Location';Name='Disable user location consent';Category='Privacy';Path='Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location';ValueName='Value';Value='Deny';Kind='String';Description='Denies location access through the user consent store; may affect apps.';Risk='Medium'},
+@{Id='Camera';Name='Disable camera app consent';Category='Privacy';Path='Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam';ValueName='Value';Value='Deny';Kind='String';Description='Denies camera access through the user consent store.';Risk='Medium'},
+@{Id='Microphone';Name='Disable microphone app consent';Category='Privacy';Path='Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone';ValueName='Value';Value='Deny';Kind='String';Description='Denies microphone access through the user consent store.';Risk='Medium'},
+@{Id='Autoplay';Name='Disable AutoPlay';Category='Explorer';Path='Software\Microsoft\Windows\CurrentVersion\Explorer\AutoplayHandlers';ValueName='DisableAutoplay';Value=1;Kind='DWord';Description='Disables AutoPlay for the current user.';Risk='Low'},
+@{Id='FileExt';Name='Show file extensions';Category='Explorer';Path='Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced';ValueName='HideFileExt';Value=0;Kind='DWord';Description='Shows known file extensions in File Explorer.';Risk='Low'},
+@{Id='HiddenFiles';Name='Show hidden files';Category='Explorer';Path='Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced';ValueName='Hidden';Value=1;Kind='DWord';Description='Shows hidden files in File Explorer.';Risk='Low'},
+@{Id='SuperHidden';Name='Show protected operating system files';Category='Explorer';Path='Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced';ValueName='ShowSuperHidden';Value=1;Kind='DWord';Description='Shows protected OS files; use caution when browsing system folders.';Risk='Medium'},
+@{Id='LaunchTo';Name='Open File Explorer to This PC';Category='Explorer';Path='Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced';ValueName='LaunchTo';Value=1;Kind='DWord';Description='Sets File Explorer default landing page to This PC.';Risk='Low'},
+@{Id='TaskbarSearch';Name='Hide taskbar search box';Category='Explorer';Path='Software\Microsoft\Windows\CurrentVersion\Search';ValueName='SearchboxTaskbarMode';Value=0;Kind='DWord';Description='Hides the taskbar search box on supported Windows builds.';Risk='Low'},
+@{Id='TaskView';Name='Hide Task View button';Category='Explorer';Path='Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced';ValueName='ShowTaskViewButton';Value=0;Kind='DWord';Description='Hides the Task View button.';Risk='Low'},
+@{Id='Widgets';Name='Hide taskbar Widgets button';Category='Explorer';Path='Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced';ValueName='TaskbarDa';Value=0;Kind='DWord';Description='Hides the Widgets button on supported Windows builds.';Risk='Low'},
+@{Id='Chat';Name='Hide Chat taskbar button';Category='Explorer';Path='Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced';ValueName='TaskbarMn';Value=0;Kind='DWord';Description='Hides the legacy Chat taskbar button where present.';Risk='Low'},
+@{Id='SnapAssist';Name='Disable Snap Assist flyout';Category='Explorer';Path='Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced';ValueName='SnapAssist';Value=0;Kind='DWord';Description='Disables the Snap Assist preference.';Risk='Low'},
+@{Id='FileSync';Name='Disable sync provider notifications';Category='Explorer';Path='Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced';ValueName='ShowSyncProviderNotifications';Value=0;Kind='DWord';Description='Hides sync-provider notifications in Explorer.';Risk='Low'},
+@{Id='SeparateProcess';Name='Launch folder windows in separate process';Category='Explorer';Path='Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced';ValueName='SeparateProcess';Value=1;Kind='DWord';Description='Runs folder windows in a separate Explorer process; uses extra memory.';Risk='Medium'},
+@{Id='VerboseStatus';Name='Show detailed shutdown messages';Category='System';Path='Software\Microsoft\Windows\CurrentVersion\Policies\System';ValueName='VerboseStatus';Value=1;Kind='DWord';Description='Shows additional status messages during sign-in and shutdown.';Risk='Low'},
+@{Id='DisableNLA';Name='Keep network location awareness default';Category='Network';Path='Software\Microsoft\Windows NT\CurrentVersion\NetworkList\Profiles';ValueName='Category';Value=0;Kind='DWord';Description='Not applied automatically: network profile category is per-profile and should be configured in Settings.';Risk='Low';Disabled=$true},
+@{Id='EdgeStartup';Name='Disable Edge startup boost preference';Category='Performance';Path='Software\Policies\Microsoft\Edge';ValueName='StartupBoostEnabled';Value=0;Kind='DWord';Description='Sets the Edge policy to disable Startup Boost for managed Edge installs.';Risk='Medium'},
+@{Id='EdgeBackground';Name='Disable Edge background mode';Category='Performance';Path='Software\Policies\Microsoft\Edge';ValueName='BackgroundModeEnabled';Value=0;Kind='DWord';Description='Sets the Edge policy to prevent background apps after Edge closes.';Risk='Medium'},
+@{Id='OfficeTelemetry';Name='Disable Office telemetry opt-in';Category='Privacy';Path='Software\Policies\Microsoft\Office\16.0\Common';ValueName='TelemetryOptIn';Value=0;Kind='DWord';Description='Sets an Office policy where supported; has no effect if Office is absent.';Risk='Medium'},
+@{Id='OneDriveFiles';Name='Disable OneDrive file sync prompts';Category='Explorer';Path='Software\Microsoft\OneDrive';ValueName='DisableTutorial';Value=1;Kind='DWord';Description='Disables the OneDrive first-run tutorial preference.';Risk='Low'},
+@{Id='PrintNotifications';Name='Hide printer notification messages';Category='System';Path='Software\Microsoft\Windows NT\CurrentVersion\Print\Providers\Client Side Rendering Print Provider';ValueName='DisableHTTPPrinting';Value=1;Kind='DWord';Description='Disables HTTP printing provider preference; may affect unusual printer workflows.';Risk='Medium'},
+@{Id='DeliveryOptimization';Name='Limit peer delivery downloads';Category='Updates';Path='Software\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Settings';ValueName='DownloadMode';Value=0;Kind='DWord';Description='Sets Delivery Optimization download mode to HTTP-only for this user.';Risk='Low'},
+@{Id='ActiveHours';Name='Set Windows active hours start';Category='Updates';Path='Software\Microsoft\WindowsUpdate\UX\Settings';ValueName='ActiveHoursStart';Value=8;Kind='DWord';Description='Sets active hours start to 8:00 where the Windows Update UI honors it.';Risk='Low'},
+@{Id='ActiveHoursEnd';Name='Set Windows active hours end';Category='Updates';Path='Software\Microsoft\WindowsUpdate\UX\Settings';ValueName='ActiveHoursEnd';Value=23;Kind='DWord';Description='Sets active hours end to 23:00 where the Windows Update UI honors it.';Risk='Low'},
+@{Id='RestartNotify';Name='Disable restart notifications during active hours';Category='Updates';Path='Software\Microsoft\WindowsUpdate\UX\Settings';ValueName='RestartNotificationsAllowed2';Value=0;Kind='DWord';Description='Changes update restart notification preference; Windows may override it.';Risk='Medium'},
+@{Id='StorageSense';Name='Enable Storage Sense';Category='Storage';Path='Software\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy';ValueName='01';Value=1;Kind='DWord';Description='Enables Storage Sense preference. Review cleanup behavior in Settings.';Risk='Low'},
+@{Id='RecycleBin';Name='Set Recycle Bin delete confirmation';Category='Storage';Path='Software\Microsoft\Windows\CurrentVersion\Policies\Explorer';ValueName='ConfirmFileDelete';Value=1;Kind='DWord';Description='Prompts before deleting files to the Recycle Bin.';Risk='Low'},
+@{Id='RecentDocs';Name='Disable recent documents tracking';Category='Privacy';Path='Software\Microsoft\Windows\CurrentVersion\Policies\Explorer';ValueName='NoRecentDocsHistory';Value=1;Kind='DWord';Description='Disables recent document history in supported shell locations.';Risk='Low'},
+@{Id='RecentJumplists';Name='Do not keep history of recently opened documents';Category='Privacy';Path='Software\Microsoft\Windows\CurrentVersion\Policies\Explorer';ValueName='NoRecentDocsNetHood';Value=1;Kind='DWord';Description='Disables a recent-documents history policy.';Risk='Low'},
+@{Id='LockScreen';Name='Disable lock screen app notifications';Category='Privacy';Path='Software\Microsoft\Windows\CurrentVersion\Notifications\Settings';ValueName='NOC_GLOBAL_SETTING_ALLOW_TOASTS_ABOVE_LOCK';Value=0;Kind='DWord';Description='Disables toast notifications above the lock screen.';Risk='Low'},
+@{Id='Toast';Name='Disable notification toast banners';Category='Privacy';Path='Software\Microsoft\Windows\CurrentVersion\PushNotifications';ValueName='ToastEnabled';Value=0;Kind='DWord';Description='Disables toast notification preference for this user.';Risk='Medium'},
+@{Id='CapsLock';Name='Turn off Caps Lock indicator behavior';Category='System';Path='Control Panel\Accessibility\Keyboard Response';ValueName='Flags';Value='122';Kind='String';Description='Sets a keyboard accessibility flags value; leave unchanged if you use Filter Keys.';Risk='Medium'},
+@{Id='NumLock';Name='Enable Num Lock at sign-in';Category='System';Path='Control Panel\Keyboard';ValueName='InitialKeyboardIndicators';Value='2';Kind='String';Description='Requests Num Lock enabled at sign-in; firmware can override it.';Risk='Low'},
+@{Id='AutoEndTasks';Name='Shorten app close wait preference';Category='Performance';Path='Control Panel\Desktop';ValueName='AutoEndTasks';Value='1';Kind='String';Description='Allows Windows to end nonresponsive user apps more quickly at shutdown.';Risk='Medium'},
+@{Id='HungAppTimeout';Name='Set hung app timeout to 3 seconds';Category='Performance';Path='Control Panel\Desktop';ValueName='HungAppTimeout';Value='3000';Kind='String';Description='Changes shutdown wait behavior; does not improve game FPS.';Risk='Medium'},
+@{Id='WaitToKill';Name='Set app shutdown wait to 3 seconds';Category='Performance';Path='Control Panel\Desktop';ValueName='WaitToKillAppTimeout';Value='3000';Kind='String';Description='Changes shutdown wait behavior; may cause unsaved work to be lost.';Risk='Medium'}
 )
 
-function Get-BackupFile { Join-Path $script:BackupRoot 'registry-backup.json' }
-function Save-RegistryBackup($Tweak) {
-    $file = Get-BackupFile
-    $all = @()
-    if (Test-Path $file) { try { $all = @(Get-Content $file -Raw | ConvertFrom-Json) } catch {} }
-    $existing = @($all | Where-Object { $_.Name -eq $Tweak.Name })
-    if ($existing.Count -gt 0) { return }
-    $key = Get-Item -LiteralPath $Tweak.Path -ErrorAction SilentlyContinue
-    $exists = $false; $old = $null; $oldKind=$Tweak.Kind
-    if ($key -and $Tweak.ValueName -ne '' -and $key.GetValueNames() -contains [string]$Tweak.ValueName) { $exists=$true; $old=$key.GetValue([string]$Tweak.ValueName,$null,'DoNotExpandEnvironmentNames'); try { $oldKind=[string]$key.GetValueKind([string]$Tweak.ValueName) } catch {} }
-    $entry = [pscustomobject]@{ Name=$Tweak.Name; Path=$Tweak.Path; ValueName=$Tweak.ValueName; Exists=$exists; Data=$old; Kind=$Tweak.Kind; ValueKind=$oldKind; Date=(Get-Date).ToString('o') }
-    $all += $entry
-    $all | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $file -Encoding UTF8
-}
-function Apply-RegistryTweak($Tweak) {
-    Save-RegistryBackup $Tweak
-    if ($Tweak.ValueName -eq '' -and $Tweak.Kind -eq 'String') {
-        New-Item -Path $Tweak.Path -Force | Out-Null
-    } else {
-        New-Item -Path $Tweak.Path -Force | Out-Null
-        New-ItemProperty -LiteralPath $Tweak.Path -Name $Tweak.ValueName -Value $Tweak.Data -PropertyType $Tweak.Kind -Force | Out-Null
+# Normalize the display model; exclude the one intentionally disabled informational item.
+$script:Tweaks = @($script:Tweaks | Where-Object { -not $_.Disabled } | ForEach-Object {
+    [pscustomobject]@{
+        Id=$_.Id; Name=$_.Name; Category=$_.Category; Path=$_.Path
+        NameValue=$_.ValueName; Value=$_.Value; Kind=$_.Kind
+        Description=$_.Description; Risk=$_.Risk
     }
-    $actual = (Get-ItemProperty -LiteralPath $Tweak.Path -Name $Tweak.ValueName -ErrorAction SilentlyContinue).$($Tweak.ValueName)
-    if ($Tweak.ValueName -ne '' -and [string]$actual -ne [string]$Tweak.Data) { throw "Verification failed for $($Tweak.Name)" }
-    Write-SolarLog "APPLIED: $($Tweak.Name)"
-}
-function Restore-RegistryBackups {
-    $file=Get-BackupFile
-    $all=@()
-    if (Test-Path $file) { $all=@(Get-Content $file -Raw | ConvertFrom-Json) }
-    $restored=0; $failed=0
-    foreach($b in $all) {
-        try {
-            if ($b.Exists) {
-                New-Item -Path $b.Path -Force | Out-Null
-                $kind=[string]$b.ValueKind
-                if ($kind -notin @('String','ExpandString','MultiString','Binary','DWord','QWord')) { $kind='String' }
-                New-ItemProperty -LiteralPath $b.Path -Name $b.ValueName -Value $b.Data -PropertyType $kind -Force | Out-Null
-            } else { Remove-ItemProperty -LiteralPath $b.Path -Name $b.ValueName -ErrorAction SilentlyContinue }
-            $restored++
-        } catch { $failed++; Write-SolarLog "RESTORE FAILED: $($b.Name) - $_" }
-    }
-    # Restore protected service/security settings recorded by Solar.
-    $pf=Join-Path $script:BackupRoot 'protected-backup.json'
-    if (Test-Path $pf) {
-        try {
-            $pb=Get-Content $pf -Raw | ConvertFrom-Json
-            foreach($x in $pb) {
-                try {
-                    switch($x.Type) {
-                        'Bluetooth' { if($x.StartMode -eq 'Auto'){sc.exe config bthserv start= auto | Out-Null} elseif($x.StartMode -eq 'Manual'){sc.exe config bthserv start= demand | Out-Null} else {sc.exe config bthserv start= disabled | Out-Null}; if($x.State -eq 'Running'){Start-Service bthserv -ErrorAction SilentlyContinue} }
-                        'Firewall' { foreach($pname in @('Domain','Private','Public')) { if($null -ne $x.$pname){Set-NetFirewallProfile -Profile $pname -Enabled ([bool]$x.$pname)} } }
-                        'Defender' { Set-MpPreference -DisableRealtimeMonitoring ([bool]$x.Disabled) }
-                    }
-                    $restored++
-                } catch { $failed++; Write-SolarLog "PROTECTED RESTORE FAILED: $($x.Type) - $_" }
-            }
-        } catch { $failed++; Write-SolarLog "Protected backup read failed: $_" }
-    }
-    Write-SolarLog "RESTORE finished: $restored restored, $failed failed"
-    [System.Windows.MessageBox]::Show("Restore finished.`nRestored: $restored`nFailed: $failed`nSome settings may require sign-out or restart.",'Solar Restore') | Out-Null
-}
-function Get-PinHash([string]$Pin,[byte[]]$Salt) {
-    $derive = [Security.Cryptography.Rfc2898DeriveBytes]::new($Pin,$Salt,180000,[Security.Cryptography.HashAlgorithmName]::SHA256)
-    return [Convert]::ToBase64String($derive.GetBytes(32))
-}
-function Confirm-SolarPin {
-    $pinFile=Join-Path $script:SolarRoot 'pin.dat'
-    if (-not (Test-Path $pinFile)) {
-        [System.Windows.MessageBox]::Show('First-time setup: enter your chosen Solar PIN (choose a PIN you will remember). It will be stored locally as a salted verifier. Do not put this PIN in the public GitHub script.','Solar Protected Controls') | Out-Null
-        $p1=[Microsoft.VisualBasic.Interaction]::InputBox('Create your Solar authorization PIN:','Solar PIN Setup','')
-        if ([string]::IsNullOrWhiteSpace($p1)) { return $false }
-        $p2=[Microsoft.VisualBasic.Interaction]::InputBox('Confirm your Solar PIN:','Solar PIN Setup','')
-        if ($p1 -ne $p2) { [System.Windows.MessageBox]::Show('PINs did not match.','Solar') | Out-Null; return $false }
-        $salt=New-Object byte[] 16; [Security.Cryptography.RandomNumberGenerator]::Fill($salt)
-        $record=[pscustomobject]@{ Salt=[Convert]::ToBase64String($salt); Hash=(Get-PinHash $p1 $salt) }
-        $record | ConvertTo-Json | Set-Content -LiteralPath $pinFile -Encoding UTF8
-        return $true
-    }
-    $record=Get-Content $pinFile -Raw | ConvertFrom-Json
-    $salt=[Convert]::FromBase64String($record.Salt)
-    $pin=[Microsoft.VisualBasic.Interaction]::InputBox('Enter your Solar authorization PIN:','Protected Controls','')
-    if ([string]::IsNullOrWhiteSpace($pin)) { return $false }
-    $ok=(Get-PinHash $pin $salt) -eq $record.Hash
-    if (-not $ok) { [System.Windows.MessageBox]::Show('Incorrect PIN. No changes were made.','Solar') | Out-Null }
-    return $ok
-}
-function Save-ProtectedBackup([string]$Type) {
-    $file=Join-Path $script:BackupRoot 'protected-backup.json'; $all=@()
-    if(Test-Path $file){try{$all=@(Get-Content $file -Raw | ConvertFrom-Json)}catch{}}
-    if(@($all | Where-Object {$_.Type -eq $Type}).Count -gt 0){return}
-    switch($Type){
-        'Bluetooth' { $svc=Get-CimInstance Win32_Service -Filter "Name='bthserv'"; $all += [pscustomobject]@{Type='Bluetooth';StartMode=$svc.StartMode;State=$svc.State} }
-        'Firewall' { $f=Get-NetFirewallProfile; $o=[ordered]@{Type='Firewall'}; foreach($p in $f){$o[$p.Name]=[bool]$p.Enabled}; $all += [pscustomobject]$o }
-        'Defender' { $pref=Get-MpPreference; $all += [pscustomobject]@{Type='Defender';Disabled=[bool]$pref.DisableRealtimeMonitoring} }
-    }
-    $all | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $file -Encoding UTF8
-}
-function Apply-ProtectedControl($Tweak) {
-    if (-not (Confirm-SolarPin)) { return }
-    $warning="This changes a protected Windows feature: $($Tweak.Name). It can reduce security or connectivity. You can use Restore to return recorded settings. Continue?"
-    if ([System.Windows.MessageBox]::Show($warning,'Solar Protected Control','YesNo','Warning') -ne 'Yes') { return }
-    switch ($Tweak.Data) {
-        'bthserv' {
-            Save-ProtectedBackup 'Bluetooth'
-            $svc=Get-CimInstance Win32_Service -Filter "Name='bthserv'"
-            if ($svc) { sc.exe config bthserv start= disabled | Out-Null; Stop-Service bthserv -Force -ErrorAction SilentlyContinue }
-        }
-        'wuauserv' {
-            # Do not force-disable Windows Update; pause via supported user settings instead.
-            Start-Process 'ms-settings:windowsupdate' -ErrorAction SilentlyContinue
-            [System.Windows.MessageBox]::Show('Windows Update settings opened. Use Pause updates there. Solar does not forcibly disable the servicing stack.','Solar') | Out-Null
-        }
-        'Defender' {
-            Save-ProtectedBackup 'Defender'
-            try { Set-MpPreference -DisableRealtimeMonitoring $true; [System.Windows.MessageBox]::Show('Requested Defender real-time protection change. Tamper Protection or policy may block/revert it. Solar does not bypass those protections.','Solar') | Out-Null } catch { throw $_ }
-        }
-        'Firewall' {
-            Save-ProtectedBackup 'Firewall'
-            Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled False
-        }
-        'SmartScreen' {
-            [System.Windows.MessageBox]::Show('SmartScreen controls are managed by Windows Security and policy. Solar will open the relevant settings rather than bypass protections.','Solar') | Out-Null
-            Start-Process 'windowsdefender:'
-        }
-    }
-    Write-SolarLog "PROTECTED ACTION REQUESTED: $($Tweak.Name)"
-}
+})
 
-Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase,Microsoft.VisualBasic
-[xml]$xaml=@'
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="SOLAR TWEAKING UTIL" Height="820" Width="1280" MinHeight="650" MinWidth="1000" WindowStartupLocation="CenterScreen" Background="#100D18" Foreground="#F4EEFF" FontFamily="Segoe UI">
+[xml]$xaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+ Title="Solar Tweaking Util" Width="1240" Height="790" MinWidth="1050" MinHeight="650" WindowStartupLocation="CenterScreen" Background="#101018" Foreground="#F3EFFA">
  <Window.Resources>
-  <Style TargetType="Button"><Setter Property="Background" Value="#7138B8"/><Setter Property="Foreground" Value="White"/><Setter Property="BorderThickness" Value="0"/><Setter Property="Padding" Value="13,8"/><Setter Property="Margin" Value="4"/><Setter Property="FontWeight" Value="SemiBold"/><Setter Property="Cursor" Value="Hand"/></Style>
-  <Style TargetType="CheckBox"><Setter Property="Foreground" Value="#F0E8FF"/><Setter Property="Margin" Value="8,6"/><Setter Property="FontSize" Value="13"/></Style>
-  <Style TargetType="TextBox"><Setter Property="Background" Value="#211A2D"/><Setter Property="Foreground" Value="White"/><Setter Property="BorderBrush" Value="#59416F"/><Setter Property="Padding" Value="9"/></Style>
-  <Style TargetType="ComboBox"><Setter Property="Background" Value="#211A2D"/><Setter Property="Foreground" Value="#171020"/><Setter Property="Padding" Value="6"/></Style>
+  <SolidColorBrush x:Key="Panel" Color="#1B1726"/><SolidColorBrush x:Key="Panel2" Color="#241D32"/><SolidColorBrush x:Key="Purple" Color="#8B50D6"/><SolidColorBrush x:Key="Muted" Color="#B9ADC9"/>
+  <Style TargetType="Button"><Setter Property="Background" Value="#332744"/><Setter Property="Foreground" Value="#F6F0FF"/><Setter Property="BorderBrush" Value="#594276"/><Setter Property="Padding" Value="12,7"/><Setter Property="Margin" Value="3"/><Setter Property="FontWeight" Value="SemiBold"/><Setter Property="Cursor" Value="Hand"/></Style>
+  <Style TargetType="TextBox"><Setter Property="Background" Value="#15111F"/><Setter Property="Foreground" Value="#F3EFFA"/><Setter Property="BorderBrush" Value="#594276"/><Setter Property="Padding" Value="8"/></Style>
+  <Style TargetType="CheckBox"><Setter Property="Foreground" Value="#F3EFFA"/><Setter Property="Margin" Value="4,6"/><Setter Property="FontSize" Value="13"/></Style>
+  <Style TargetType="ListBoxItem"><Setter Property="Padding" Value="8,6"/><Setter Property="Margin" Value="2"/><Setter Property="Foreground" Value="#EEE7FA"/></Style>
  </Window.Resources>
- <Grid Margin="14"><Grid.RowDefinitions><RowDefinition Height="70"/><RowDefinition Height="*"/><RowDefinition Height="36"/></Grid.RowDefinitions>
-  <Border Grid.Row="0" Background="#21152F" CornerRadius="10" Padding="14" Margin="0,0,0,12"><DockPanel><StackPanel Orientation="Horizontal" DockPanel.Dock="Left"><Border Background="#813ED0" CornerRadius="9" Width="42" Height="42"><TextBlock Text="S" FontSize="29" FontWeight="Bold" HorizontalAlignment="Center" VerticalAlignment="Center"/></Border><StackPanel Margin="12,0,0,0" VerticalAlignment="Center"><TextBlock Text="SOLAR TWEAKING UTIL" FontSize="21" FontWeight="Bold"/><TextBlock Text="WINDOWS 11 PERFORMANCE • DEBLOAT • CONTROL" Foreground="#C4A5E8" FontSize="10"/></StackPanel></StackPanel><TextBlock x:Name="AdminLabel" Text="ADMINISTRATOR" Foreground="#CDAAFF" VerticalAlignment="Center" HorizontalAlignment="Right"/></DockPanel></Border>
-  <Grid Grid.Row="1"><Grid.ColumnDefinitions><ColumnDefinition Width="210"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-   <Border Grid.Column="0" Background="#1B1525" CornerRadius="10" Padding="10" Margin="0,0,12,0"><StackPanel><TextBlock Text="WORKSPACE" Foreground="#A98AC8" FontWeight="Bold" Margin="8,8"/><ListBox x:Name="Categories" Background="Transparent" BorderThickness="0" Foreground="#F0E8FF" FontSize="14"/><Separator Margin="5,12" Background="#49345D"/><Button x:Name="ApplyBtn" Content="APPLY SELECTED"/><Button x:Name="RestoreBtn" Content="RESTORE BACKUPS" Background="#49345D"/><Button x:Name="AuditBtn" Content="SYSTEM AUDIT" Background="#49345D"/><Button x:Name="SelectBtn" Content="SELECT VISIBLE" Background="#49345D"/><Button x:Name="ClearBtn" Content="CLEAR SELECTION" Background="#49345D"/></StackPanel></Border>
-   <Grid Grid.Column="1"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="100"/></Grid.RowDefinitions>
-    <DockPanel Grid.Row="0" Margin="0,0,0,10"><StackPanel DockPanel.Dock="Left"><TextBlock x:Name="SectionTitle" Text="All Tweaks" FontSize="22" FontWeight="Bold"/><TextBlock x:Name="SectionSub" Text="Select changes to apply. Review descriptions before use." Foreground="#B7A6C9"/></StackPanel><TextBox x:Name="SearchBox" Width="290" Height="34" VerticalContentAlignment="Center" HorizontalAlignment="Right" ToolTip="Search tweaks"/></DockPanel>
-    <Border Grid.Row="1" Background="#1B1525" CornerRadius="10" Padding="10"><ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel x:Name="TweakPanel"/></ScrollViewer></Border>
-    <Border Grid.Row="2" Background="#21152F" CornerRadius="10" Padding="10" Margin="0,10,0,0"><DockPanel><StackPanel DockPanel.Dock="Left"><TextBlock Text="EXECUTION LOG" FontWeight="Bold" Foreground="#CDAAFF"/><TextBlock x:Name="StatusText" Text="Ready. No changes have been made." Margin="0,5,0,0"/></StackPanel><StackPanel HorizontalAlignment="Right" VerticalAlignment="Center"><TextBlock x:Name="CountText" Text="0 selected" Foreground="#CDAAFF"/><TextBlock Text="Changes may require sign-out or restart." Foreground="#9F91AE" FontSize="10"/></StackPanel></DockPanel></Border>
+ <DockPanel>
+  <Border DockPanel.Dock="Top" Background="#1D172A" Padding="12">
+   <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+    <StackPanel Orientation="Horizontal"><Border Background="#8247C8" CornerRadius="7" Width="42" Height="42" Margin="0,0,12,0"><TextBlock Text="S" FontSize="29" FontWeight="Bold" HorizontalAlignment="Center" VerticalAlignment="Center"/></Border><StackPanel><TextBlock Text="SOLAR TWEAKING UTIL" FontSize="20" FontWeight="Bold"/><TextBlock Text="WINDOWS 11 • PERFORMANCE • DEBLOAT • CONTROL" FontSize="10" Foreground="#BBA8D8"/></StackPanel></StackPanel>
+    <TextBlock Grid.Column="1" Text="ADMINISTRATOR  •  REVERSIBLE REGISTRY PROFILE" Foreground="#C7A5FF" VerticalAlignment="Center" FontSize="11"/>
+   </Grid>
+  </Border>
+  <Border DockPanel.Dock="Bottom" Background="#1D172A" Padding="8">
+   <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+    <TextBlock x:Name="StatusText" Text="Ready. Select actions to apply." Foreground="#CBBDE0" VerticalAlignment="Center" Margin="6"/>
+    <Button x:Name="ApplyButton" Grid.Column="1" Content="APPLY SELECTED" Background="#7040B4" MinWidth="145"/>
+    <Button x:Name="RestoreButton" Grid.Column="2" Content="RESTORE SESSION" MinWidth="145"/>
+    <Button x:Name="AuditButton" Grid.Column="3" Content="SYSTEM AUDIT" MinWidth="120"/>
+   </Grid>
+  </Border>
+  <Grid Margin="10">
+   <Grid.ColumnDefinitions><ColumnDefinition Width="178"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+   <Border Background="{StaticResource Panel}" CornerRadius="9" Padding="9" Margin="0,0,9,0">
+    <DockPanel>
+     <StackPanel DockPanel.Dock="Top">
+      <TextBlock Text="WORKSPACE" Foreground="#B99AE5" FontSize="11" FontWeight="Bold" Margin="4,8"/>
+      <ListBox x:Name="Categories" Background="Transparent" BorderThickness="0">
+       <ListBoxItem Content="All Tweaks" IsSelected="True"/><ListBoxItem Content="Gaming"/><ListBoxItem Content="Explorer"/><ListBoxItem Content="Privacy"/><ListBoxItem Content="Performance"/><ListBoxItem Content="Updates"/><ListBoxItem Content="Storage"/><ListBoxItem Content="System"/>
+      </ListBox>
+      <Separator Margin="3,10" Background="#514064"/>
+      <Button x:Name="SelectVisible" Content="SELECT VISIBLE"/>
+      <Button x:Name="ClearSelection" Content="CLEAR SELECTION"/>
+      <Button x:Name="PresetStandard" Content="STANDARD PRESET"/>
+      <Button x:Name="PresetGaming" Content="GAMING PRESET"/>
+      <Button x:Name="PresetPrivacy" Content="PRIVACY PRESET"/>
+     </StackPanel>
+     <TextBlock DockPanel.Dock="Bottom" Text="Solar • Independent build" Foreground="#8E819F" FontSize="10" Margin="4,10"/>
+    </DockPanel>
+   </Border>
+   <Grid Grid.Column="1">
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="110"/></Grid.RowDefinitions>
+    <Grid Margin="2,0,2,8">
+     <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="290"/></Grid.ColumnDefinitions>
+     <StackPanel><TextBlock x:Name="PageTitle" Text="All Tweaks" FontSize="21" FontWeight="Bold"/><TextBlock x:Name="CountText" Text="Loading actions..." Foreground="#C4B5D8" FontSize="11"/></StackPanel>
+     <TextBox x:Name="SearchBox" Grid.Column="1" Height="34" VerticalContentAlignment="Center" ToolTip="Search tweaks by name, category, or description"/>
+    </Grid>
+    <Border Grid.Row="1" Background="{StaticResource Panel}" CornerRadius="9" Padding="8">
+     <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="270"/></Grid.ColumnDefinitions>
+      <ListView x:Name="TweakList" Background="Transparent" BorderThickness="0" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+       <ListView.ItemTemplate><DataTemplate>
+        <Border Background="#241D32" CornerRadius="6" Padding="8" Margin="2">
+         <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="28"/><ColumnDefinition Width="*"/><ColumnDefinition Width="75"/></Grid.ColumnDefinitions>
+          <CheckBox IsChecked="{Binding Selected, Mode=TwoWay}" VerticalAlignment="Center"/>
+          <StackPanel Grid.Column="1"><TextBlock Text="{Binding Name}" FontWeight="SemiBold" Foreground="#F6F0FC"/><TextBlock Text="{Binding Summary}" Foreground="#BBAED0" FontSize="10" TextTrimming="CharacterEllipsis"/></StackPanel>
+          <TextBlock Grid.Column="2" Text="{Binding Risk}" Foreground="#C5A1F5" FontSize="10" VerticalAlignment="Center" HorizontalAlignment="Right"/>
+         </Grid>
+        </Border>
+       </DataTemplate></ListView.ItemTemplate>
+      </ListView>
+      <Border Grid.Column="1" Background="#211A2D" CornerRadius="7" Padding="12" Margin="8,0,0,0">
+       <StackPanel>
+        <TextBlock Text="ACTION DETAILS" Foreground="#C7A5FF" FontWeight="Bold" FontSize="13"/>
+        <TextBlock x:Name="DetailName" Text="Select an action" FontWeight="Bold" Margin="0,12,0,5" TextWrapping="Wrap"/>
+        <TextBlock x:Name="DetailCategory" Foreground="#BCA8D5" FontSize="10"/>
+        <TextBlock x:Name="DetailDescription" Foreground="#D5CDE0" TextWrapping="Wrap" Margin="0,12,0,10"/>
+        <TextBlock Text="Risk level" Foreground="#A99AB9" FontSize="10"/>
+        <TextBlock x:Name="DetailRisk" Foreground="#C7A5FF" FontWeight="SemiBold" Margin="0,3,0,10"/>
+        <Separator Background="#514064"/>
+        <TextBlock Text="Backups are created before each registry change. Restore Session reverses changes made by this run. Some Windows preferences may require sign-out or restart." Foreground="#AFA3BE" FontSize="10" TextWrapping="Wrap" Margin="0,10,0,0"/>
+       </StackPanel>
+      </Border>
+     </Grid>
+    </Border>
+    <Border Grid.Row="2" Background="{StaticResource Panel}" CornerRadius="9" Padding="10" Margin="0,8,0,0">
+     <DockPanel><TextBlock DockPanel.Dock="Top" Text="EXECUTION LOG" Foreground="#C7A5FF" FontWeight="Bold" FontSize="11" Margin="0,0,0,5"/><TextBox x:Name="LogBox" Background="#15111F" BorderThickness="0" IsReadOnly="True" AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" FontSize="10" FontFamily="Consolas"/></DockPanel>
+    </Border>
    </Grid>
   </Grid>
-  <TextBlock Grid.Row="2" Text="SOLAR TWEAKING UTIL  •  LOCAL BACKUPS  •  REVIEW BEFORE APPLYING" Foreground="#8F7AA5" VerticalAlignment="Center" HorizontalAlignment="Center" FontSize="10"/>
- </Grid>
+ </DockPanel>
 </Window>
 '@
-$reader=New-Object System.Xml.XmlNodeReader $xaml
-$window=[Windows.Markup.XamlReader]::Load($reader)
-$script:ui=@{}
-'Categories','TweakPanel','SearchBox','SectionTitle','SectionSub','StatusText','CountText','ApplyBtn','RestoreBtn','AuditBtn','SelectBtn','ClearBtn','AdminLabel' | ForEach-Object { $script:ui[$_]=$window.FindName($_) }
-$script:categories=@('All Tweaks') + @($script:Tweaks | Select-Object -ExpandProperty Category -Unique)
-foreach($c in $script:categories){ [void]$script:ui.Categories.Items.Add($c) }
-$script:ui.Categories.SelectedIndex=0
-$script:checks=New-Object System.Collections.ArrayList
-function Refresh-TweakList {
-    $script:ui.TweakPanel.Children.Clear(); $script:checks.Clear()
-    $cat=[string]$script:ui.Categories.SelectedItem; $q=[string]$script:ui.SearchBox.Text
-    $filtered=@($script:Tweaks | Where-Object { ($cat -eq 'All Tweaks' -or $_.Category -eq $cat) -and ($_.Name -like "*$q*" -or $_.Category -like "*$q*") })
-    $script:ui.SectionTitle.Text=$cat
-    $script:ui.SectionSub.Text="$($filtered.Count) available actions • Registry changes are backed up before applying"
-    foreach($t in $filtered){
-        $border=New-Object Windows.Controls.Border; $border.Background=[Windows.Media.BrushConverter]::new().ConvertFromString('#241C31'); $border.CornerRadius='6'; $border.Margin='3'; $border.Padding='8'
-        $sp=New-Object Windows.Controls.StackPanel
-        $cb=New-Object Windows.Controls.CheckBox; $cb.Content=$t.Name; $cb.Tag=$t; $cb.FontWeight='SemiBold'
-        $desc=New-Object Windows.Controls.TextBlock; $desc.Text=if($t.Protected){'PROTECTED CONTROL • Requires Solar PIN and separate confirmation'}else{"$($t.Category) • Saves the previous registry value before applying"}; $desc.Foreground=[Windows.Media.BrushConverter]::new().ConvertFromString('#B5A3C9'); $desc.FontSize=10; $desc.Margin='28,0,0,0'
-        [void]$sp.Children.Add($cb); [void]$sp.Children.Add($desc); $border.Child=$sp; [void]$script:ui.TweakPanel.Children.Add($border); [void]$script:checks.Add($cb)
-        $cb.Add_Checked({ Update-Count }); $cb.Add_Unchecked({ Update-Count })
+
+$reader = New-Object System.Xml.XmlNodeReader $xaml
+$window = [Windows.Markup.XamlReader]::Load($reader)
+foreach ($n in @('StatusText','LogBox')) { Set-Variable -Scope Script -Name $n -Value $window.FindName($n) }
+$script:StatusText = $window.FindName('StatusText')
+$script:LogBox = $window.FindName('LogBox')
+$list = $window.FindName('TweakList')
+$categoryList = $window.FindName('Categories')
+$search = $window.FindName('SearchBox')
+$allRows = @($script:Tweaks | ForEach-Object {
+    [pscustomobject]@{
+        Id=$_.Id; Name=$_.Name; Category=$_.Category; Path=$_.Path
+        ValueName=$_.NameValue; Value=$_.Value; Kind=$_.Kind
+        Description=$_.Description; Risk=$_.Risk; Selected=$false
+        Summary=("$($_.Category) • $($_.Description)")
     }
-    Update-Count
+})
+$view = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
+function Refresh-List {
+    $view.Clear()
+    $cat = [string]$categoryList.SelectedItem.Content
+    $term = $search.Text.Trim()
+    foreach ($row in $allRows) {
+        $categoryMatch = ($cat -eq 'All Tweaks' -or $row.Category -eq $cat)
+        $searchMatch = ([string]::IsNullOrWhiteSpace($term) -or
+            $row.Name.IndexOf($term,[StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+            $row.Description.IndexOf($term,[StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+            $row.Category.IndexOf($term,[StringComparison]::OrdinalIgnoreCase) -ge 0)
+        if ($categoryMatch -and $searchMatch) { $view.Add($row) }
+    }
+    $list.ItemsSource = $null
+    $list.ItemsSource = $view
+    $window.FindName('PageTitle').Text = $cat
+    $window.FindName('CountText').Text = "$($view.Count) visible • $($allRows.Count) available actions • backed-up registry preferences"
 }
-function Update-Count { $n=@($script:checks | Where-Object {$_.IsChecked}).Count; $script:ui.CountText.Text="$n selected" }
-$script:ui.Categories.Add_SelectionChanged({ Refresh-TweakList })
-$script:ui.SearchBox.Add_TextChanged({ Refresh-TweakList })
-$script:ui.SelectBtn.Add_Click({ foreach($c in $script:checks){$c.IsChecked=$true}; Update-Count })
-$script:ui.ClearBtn.Add_Click({ foreach($c in $script:checks){$c.IsChecked=$false}; Update-Count })
-$script:ui.RestoreBtn.Add_Click({ Restore-RegistryBackups })
-$script:ui.AuditBtn.Add_Click({
-    $os=Get-CimInstance Win32_OperatingSystem; $cpu=Get-CimInstance Win32_Processor | Select-Object -First 1; $gpu=Get-CimInstance Win32_VideoController | Select-Object -First 1
-    $msg="OS: $($os.Caption)`nBuild: $($os.BuildNumber)`nCPU: $($cpu.Name)`nGPU: $($gpu.Name)`nRAM: $([math]::Round($os.TotalVisibleMemorySize/1MB,1)) GB`nProcesses: $((Get-Process).Count)`n`nThis is an inventory only; no settings changed."
-    [System.Windows.MessageBox]::Show($msg,'Solar System Audit') | Out-Null
+Refresh-List
+$categoryList.Add_SelectionChanged({ Refresh-List })
+$search.Add_TextChanged({ Refresh-List })
+$list.Add_SelectionChanged({
+    $row = $list.SelectedItem
+    if ($row) {
+        $window.FindName('DetailName').Text = $row.Name
+        $window.FindName('DetailCategory').Text = "$($row.Category)  •  $($row.Id)"
+        $window.FindName('DetailDescription').Text = $row.Description
+        $window.FindName('DetailRisk').Text = $row.Risk
+    }
 })
-$script:ui.ApplyBtn.Add_Click({
-    $selected=@($script:checks | Where-Object {$_.IsChecked} | ForEach-Object {$_.Tag})
-    if($selected.Count -eq 0){ [System.Windows.MessageBox]::Show('Select at least one action.','Solar') | Out-Null; return }
-    $normal=@($selected | Where-Object {-not $_.Protected}); $protected=@($selected | Where-Object {$_.Protected})
-    $confirm=[System.Windows.MessageBox]::Show("Apply $($normal.Count) standard changes and request $($protected.Count) protected controls?`n`nA backup is created before each registry change. Some tweaks may not improve FPS and may require restart.",'Confirm Solar Changes','YesNo','Warning')
-    if($confirm -ne 'Yes'){return}
-    $ok=0;$fail=0
-    foreach($t in $normal){ try { Apply-RegistryTweak $t; $ok++ } catch { $fail++; Write-SolarLog "FAILED: $($t.Name) - $_" } }
-    foreach($t in $protected){ try { Apply-ProtectedControl $t; $ok++ } catch { $fail++; Write-SolarLog "PROTECTED FAILED: $($t.Name) - $_" } }
-    $script:ui.StatusText.Text="Finished: $ok successful actions, $fail failed. See $script:LogFile"
-    [System.Windows.MessageBox]::Show("Completed.`nSuccessful: $ok`nFailed: $fail`nLog: $script:LogFile`nRestart or sign out may be required.",'Solar Results') | Out-Null
+$window.FindName('SelectVisible').Add_Click({ foreach ($row in $view) { $row.Selected=$true }; $list.Items.Refresh() })
+$window.FindName('ClearSelection').Add_Click({ foreach ($row in $allRows) { $row.Selected=$false }; $list.Items.Refresh() })
+$window.FindName('PresetStandard').Add_Click({
+    foreach ($row in $allRows) { $row.Selected = ($row.Id -in @('GameMode','GameMode2','GameDVR','GameDVR2','MouseSpeed','MouseThreshold1','MouseThreshold2','FileExt','HiddenFiles')) }
+    $list.Items.Refresh(); Write-Log 'Standard preset selected. Nothing applied yet.'
 })
-$script:ui.AdminLabel.Text="ADMINISTRATOR • $($script:Tweaks.Count) ACTIONS"
-Refresh-TweakList
-[void]$window.ShowDialog()
+$window.FindName('PresetGaming').Add_Click({
+    foreach ($row in $allRows) { $row.Selected = ($row.Category -eq 'Gaming' -or $row.Id -in @('VisualFX','MenuDelay','TaskbarAnimations','Transparency')) }
+    $list.Items.Refresh(); Write-Log 'Gaming preset selected. Nothing applied yet.'
+})
+$window.FindName('PresetPrivacy').Add_Click({
+    foreach ($row in $allRows) { $row.Selected = ($row.Category -eq 'Privacy') }
+    $list.Items.Refresh(); Write-Log 'Privacy preset selected. Nothing applied yet.'
+})
+$window.FindName('ApplyButton').Add_Click({
+    $chosen = @($allRows | Where-Object Selected)
+    if ($chosen.Count -eq 0) { [System.Windows.MessageBox]::Show('Select at least one action first.','Solar') | Out-Null; return }
+    $names = ($chosen | ForEach-Object Name) -join "`n"
+    if ([System.Windows.MessageBox]::Show("Apply $($chosen.Count) selected registry preferences?`n`n$names`n`nA backup is saved before each value is changed.",'Confirm Solar Tweaks','YesNo','Warning') -ne 'Yes') { return }
+    foreach ($tweak in $chosen) {
+        try {
+            $applyObject = [pscustomobject]@{ Path=$tweak.Path; Name=$tweak.ValueName; Value=$tweak.Value; Kind=$tweak.Kind }
+            Set-SolarRegistryValue $applyObject
+            Write-Log "Applied: $($tweak.Name)"
+        } catch { Write-Log "FAILED: $($tweak.Name) — $($_.Exception.Message)" }
+    }
+    Write-Log "Apply run finished. Backup: $script:SessionBackup"
+})
+$window.FindName('RestoreButton').Add_Click({
+    if ([System.Windows.MessageBox]::Show("Restore registry values changed during this session?`n`n$script:SessionBackup",'Confirm Restore','YesNo','Warning') -ne 'Yes') { return }
+    Restore-RegistryBackup -File $script:BackupFile
+    Write-Log 'Session registry restore finished.'
+})
+$window.FindName('AuditButton').Add_Click({
+    $os = Get-CimInstance Win32_OperatingSystem
+    $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+    $gpu = Get-CimInstance Win32_VideoController | Select-Object -First 1
+    $ram = [math]::Round($os.TotalVisibleMemorySize/1MB,1)
+    Write-Log "AUDIT: $($os.Caption) build $($os.BuildNumber) | CPU: $($cpu.Name) | GPU: $($gpu.Name) | RAM: $ram GB"
+    Write-Log "Power plan: $((powercfg /getactivescheme) -join ' ')"
+})
+Write-Log "Solar started. $($allRows.Count) actual registry preference actions loaded."
+$null = $window.ShowDialog()
