@@ -95,7 +95,26 @@ try {
         '$solarLetter.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Center',
         '$solarLetter.VerticalAlignment = [System.Windows.VerticalAlignment]::Center',
         '$solarLogo.Child = $solarLetter',
-        '$NavLogoPanel.Children.Add($solarLogo) | Out-Null'
+        '$NavLogoPanel.Children.Add($solarLogo) | Out-Null
+$solarLauncherButton = New-Object System.Windows.Controls.Button
+$solarLauncherButton.Content = 'Solar Tweaks'
+$solarLauncherButton.Margin = [System.Windows.Thickness]::new(8,0,0,0)
+$solarLauncherButton.Padding = [System.Windows.Thickness]::new(12,5,12,5)
+$solarLauncherButton.MinWidth = 92
+$solarLauncherButton.ToolTip = 'Open Solar Tweaks and Windows controls'
+$solarLauncherButton.Add_Click({
+    try {
+        $solarScriptUrl = 'https://raw.githubusercontent.com/solar-tweaking-util/solar-tweaking-util/main/solar-live-20261124.ps1?cache=' + [Guid]::NewGuid().ToString('N')
+        $solarScript = Invoke-RestMethod -Uri $solarScriptUrl -UseBasicParsing
+        if ([string]::IsNullOrWhiteSpace($solarScript) -or $solarScript.Length -lt 20000) {
+            throw 'Solar controls download was incomplete. No Solar actions were run.'
+        }
+        Invoke-Expression $solarScript
+    } catch {
+        [System.Windows.MessageBox]::Show(('Solar controls could not open: ' + $_.Exception.Message),'Solar Tweaking Util','OK','Error') | Out-Null
+    }
+})
+$NavLogoPanel.Children.Add($solarLauncherButton) | Out-Null'
     )
 
     $logoReplacement = $logoLines -join [Environment]::NewLine
