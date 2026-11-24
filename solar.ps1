@@ -25,9 +25,9 @@ try {
         $solarLogo = New-Object System.Windows.Controls.Border
         $solarLogo.Width = 28
         $solarLogo.Height = 28
-        $solarLogo.CornerRadius = New-Object System.Windows.CornerRadius(6)
+        $solarLogo.CornerRadius = [System.Windows.CornerRadius]::new(6)
         $solarLogo.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#B78AF2')
-        $solarLogo.Margin = New-Object System.Windows.Thickness(0,0,0,0)
+        $solarLogo.Margin = [System.Windows.Thickness]::new(0,0,0,0)
         $solarLetter = New-Object System.Windows.Controls.TextBlock
         $solarLetter.Text = 'S'
         $solarLetter.FontSize = 21
