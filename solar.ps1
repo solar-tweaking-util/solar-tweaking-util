@@ -68,7 +68,7 @@ try {
     $lineStart = $source.LastIndexOf("`n", $logoIndex)
     if ($lineStart -lt 0) { $lineStart = 0 } else { $lineStart++ }
     $indent = $source.Substring($lineStart, $logoIndex - $lineStart)
-    if ($indent -notmatch '^[ `t]*$') {
+    if ($indent.Trim().Length -ne 0) {
         throw 'The WinUtil navigation-logo statement was not at the start of a line. No UI changes were made.'
     }
 
