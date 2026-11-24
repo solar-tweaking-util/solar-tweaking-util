@@ -39,6 +39,16 @@ try {
         throw 'The downloaded file is not a complete WinUtil PowerShell script.'
     }
 
+    # Find the exact upstream statement by literal text. IndexOf avoids regex/CRLF anchoring failures.
+    $logoStatement = '$NavLogoPanel.Children.Add((Invoke-WinUtilAssets -Type "logo" -Size 25)) | Out-Null'
+    $logoIndex = $source.IndexOf($logoStatement, [StringComparison]::Ordinal)
+    if ($logoIndex -lt 0) {
+        throw 'Could not locate the exact WinUtil navigation-logo statement. No UI changes were made.'
+    }
+    if ($source.IndexOf($logoStatement, $logoIndex + $logoStatement.Length, [StringComparison]::Ordinal) -ge 0) {
+        throw 'Found multiple WinUtil navigation-logo statements; refusing an ambiguous patch.'
+    }
+
     # The compiled release embeds its WPF XAML in the $inputXML variable.
     $xamlStart = $source.IndexOf('$inputXML', [StringComparison]::OrdinalIgnoreCase)
     if ($xamlStart -lt 0) {
@@ -54,16 +64,6 @@ try {
     $absoluteTitleIndex = $xamlStart + $titleMatch.Index
     $newTitle = [regex]::Replace($titleMatch.Value, '"Winutil"', '"Solar Tweaking Util"', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
     $source = $source.Substring(0, $absoluteTitleIndex) + $newTitle + $source.Substring($absoluteTitleIndex + $titleMatch.Length)
-
-    # Find the exact upstream statement by literal text. IndexOf avoids regex/CRLF anchoring failures.
-    $logoStatement = '$NavLogoPanel.Children.Add((Invoke-WinUtilAssets -Type "logo" -Size 25)) | Out-Null'
-    $logoIndex = $source.IndexOf($logoStatement, [StringComparison]::Ordinal)
-    if ($logoIndex -lt 0) {
-        throw 'Could not locate the exact WinUtil navigation-logo statement. No UI changes were made.'
-    }
-    if ($source.IndexOf($logoStatement, $logoIndex + $logoStatement.Length, [StringComparison]::Ordinal) -ge 0) {
-        throw 'Found multiple WinUtil navigation-logo statements; refusing an ambiguous patch.'
-    }
 
     $lineStart = $source.LastIndexOf("`n", $logoIndex)
     if ($lineStart -lt 0) { $lineStart = 0 } else { $lineStart++ }
@@ -91,7 +91,7 @@ try {
     )
 
     $logoReplacement = ($logoLines | ForEach-Object { $indent + $_ }) -join [Environment]::NewLine
-    $source = $source.Substring(0, $logoMatch.Index) + $logoReplacement + $source.Substring($logoMatch.Index + $logoMatch.Length)
+    $source = $source.Substring(0, $logoIndex) + $logoReplacement + $source.Substring($logoIndex + $logoStatement.Length)
 
     Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
     $tempFile = $null
