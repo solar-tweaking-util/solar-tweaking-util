@@ -55,14 +55,23 @@ try {
     $newTitle = [regex]::Replace($titleMatch.Value, '"Winutil"', '"Solar Tweaking Util"', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
     $source = $source.Substring(0, $absoluteTitleIndex) + $newTitle + $source.Substring($absoluteTitleIndex + $titleMatch.Length)
 
-    # Match the actual navigation-logo statement while tolerating spacing and casing differences.
-    $logoPattern = '(?m)^(?<indent>[ \t]*)\$NavLogoPanel\.Children\.Add\(\(Invoke-WinUtilAssets[ \t]+-Type[ \t]+"logo"[ \t]+-Size[ \t]+25\)\)[ \t]*\|[ \t]*Out-Null[ \t]*$'
-    $logoMatch = [regex]::Match($source, $logoPattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
-    if (-not $logoMatch.Success) {
-        throw 'Could not locate the actual WinUtil navigation-logo hook. No UI changes were made.'
+    # Find the exact upstream statement by literal text. IndexOf avoids regex/CRLF anchoring failures.
+    $logoStatement = '$NavLogoPanel.Children.Add((Invoke-WinUtilAssets -Type "logo" -Size 25)) | Out-Null'
+    $logoIndex = $source.IndexOf($logoStatement, [StringComparison]::Ordinal)
+    if ($logoIndex -lt 0) {
+        throw 'Could not locate the exact WinUtil navigation-logo statement. No UI changes were made.'
+    }
+    if ($source.IndexOf($logoStatement, $logoIndex + $logoStatement.Length, [StringComparison]::Ordinal) -ge 0) {
+        throw 'Found multiple WinUtil navigation-logo statements; refusing an ambiguous patch.'
     }
 
-    $indent = $logoMatch.Groups['indent'].Value
+    $lineStart = $source.LastIndexOf("`n", $logoIndex)
+    if ($lineStart -lt 0) { $lineStart = 0 } else { $lineStart++ }
+    $indent = $source.Substring($lineStart, $logoIndex - $lineStart)
+    if ($indent -notmatch '^[ `t]*$') {
+        throw 'The WinUtil navigation-logo statement was not at the start of a line. No UI changes were made.'
+    }
+
     $logoLines = @(
         '$solarLogo = New-Object System.Windows.Controls.Border',
         '$solarLogo.Width = 25',
