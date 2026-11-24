@@ -78,13 +78,8 @@ try {
         throw 'The WinUtil logo hook disappeared after the title edit. No UI changes were applied.'
     }
 
-    $lineStart = $source.LastIndexOf("`n", $logoIndex)
-    if ($lineStart -lt 0) { $lineStart = 0 } else { $lineStart++ }
-    $indent = $source.Substring($lineStart, $logoIndex - $lineStart)
-    if ($indent.Trim().Length -ne 0) {
-        throw 'The WinUtil navigation-logo statement was not at the start of a line. No UI changes were made.'
-    }
-
+    # Replace only the statement. PowerShell does not require indentation, and the
+    # original indentation before the first replacement line is preserved automatically.
     $logoLines = @(
         '$solarLogo = New-Object System.Windows.Controls.Border',
         '$solarLogo.Width = 25',
@@ -103,7 +98,7 @@ try {
         '$NavLogoPanel.Children.Add($solarLogo) | Out-Null'
     )
 
-    $logoReplacement = ($logoLines | ForEach-Object { $indent + $_ }) -join [Environment]::NewLine
+    $logoReplacement = $logoLines -join [Environment]::NewLine
     $source = $source.Substring(0, $logoIndex) + $logoReplacement + $source.Substring($logoIndex + $logoStatement.Length)
 
     Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
