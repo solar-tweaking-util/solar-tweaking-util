@@ -1,4 +1,5 @@
 # Solar Tweaking Util - compact WinUtil-inspired Windows 11 utility
+# Release marker: 2026-11-24T01:06Z - independent Solar WPF build; no WinUtil logo patcher.
 # Independent PowerShell/WPF implementation. Requires Windows PowerShell 5.1+ and Administrator.
 # Registry preferences are backed up before modification. Review descriptions before applying.
 # This utility does not bypass Tamper Protection, Secure Boot, driver protections, or thermal safeguards.
