@@ -42,8 +42,15 @@ try {
     # Find the exact upstream statement by literal text. IndexOf avoids regex/CRLF anchoring failures.
     $logoStatement = '$NavLogoPanel.Children.Add((Invoke-WinUtilAssets -Type "logo" -Size 25)) | Out-Null'
     $logoIndex = $source.IndexOf($logoStatement, [StringComparison]::Ordinal)
+    Write-Host ('DEBUG release: ' + $release.tag_name)
+    Write-Host ('DEBUG file bytes: ' + (Get-Item -LiteralPath $tempFile).Length)
+    Write-Host ('DEBUG source chars: ' + $source.Length)
+    Write-Host ('DEBUG SHA256: ' + (Get-FileHash -LiteralPath $tempFile -Algorithm SHA256).Hash)
+    Write-Host ('DEBUG logo index: ' + $logoIndex)
     if ($logoIndex -lt 0) {
-        throw 'Could not locate the exact WinUtil navigation-logo statement. No UI changes were made.'
+        $candidate = $source -split "`n" | Where-Object { $_ -match 'NavLogoPanel.*Children.*Add' } | Select-Object -First 1
+        Write-Host ('DEBUG candidate line: ' + $candidate)
+        throw 'Logo hook not found in the downloaded release; diagnostic values printed above. No UI changes were made.'
     }
     if ($source.IndexOf($logoStatement, $logoIndex + $logoStatement.Length, [StringComparison]::Ordinal) -ge 0) {
         throw 'Found multiple WinUtil navigation-logo statements; refusing an ambiguous patch.'
